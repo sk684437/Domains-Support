@@ -8,7 +8,10 @@
 
 
 
-一个基于 Cloudflare Pages 的域名管理系统，帮助您轻松管理和监控多个域名的状态、到期时间等信息。
+一个基于 Cloudflare Pages 的域名管理系统，帮助您轻松管理和监控多个域名的状态、到期时间等信息。需配合serv00或者[DScheck](https://github.com/frankiejun/DScheck)使用.
+
+## 视频教学  
+[Domains-Support 配合SERV00/hostUNO，堪称养域名神器！](https://youtu.be/gPJ7tjRKnzo?si=X7zD4eiW7AyeXshQ)
 
 ## 功能特点
 
@@ -19,6 +22,9 @@
 - Telegram 通知：支持通过 Telegram 发送到期提醒
 - 响应式设计：支持移动端和桌面端访问
 - 安全认证：基于用户名密码的访问控制
+
+## 界面展示  
+![alt text](image/image.png)
 
 ## 批量导入说明
 
@@ -113,12 +119,26 @@
 ### 1. 域名检查 API
 
 **端点**: `/api/check`
-**方法**: GET 或 POST
-**认证**: 需要 API Token（通过 URL 参数或 Bearer Token）
+**方法**: POST
+**认证**: 需要 API Token（通过 Bearer Token）
 
-认证方式（二选一）：
-1. URL 参数：`/api/check?token=your_token`
-2. Bearer Token：`Authorization: Bearer your_token`
+**请求体 (JSON)**:
+当使用 `POST` 方法时，请求体必须为 JSON 格式，包含一个 `domains` 数组。
+```json
+{
+    "domains": [
+        "a.com",
+        "b.com",
+        "c.com"
+    ]
+}
+```
+**说明**:
+- `domains`: 包含要检查的域名字符串数组。程序将只对这些域名进行检查，并确保它们在数据库中存在且启用了通知。
+
+认证方式： 
+
+ Bearer Token：`Authorization: Bearer your_token`
 
 响应：
 ```json
@@ -137,6 +157,7 @@
     }
 }
 ```
+**注意**: 离线和过期通知现在会进行汇总，以减少子请求数量。通知详情将通过 Telegram 或微信发送。
 
 ### 2. 域名列表 API
 
@@ -172,6 +193,10 @@
 - `USER`: 管理员用户名
 - `PASS`: 管理员密码
 - `API_TOKEN`: API 访问令牌
+
+## 调度器
+
+由于pages项目无法自我定时唤醒，需要配合[DScheck](https://github.com/frankiejun/DScheck)项目一同使用。
 
 ## 贡献指南
 

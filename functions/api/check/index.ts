@@ -34,7 +34,17 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
             }, { status: 401 })
         }
 
-        console.log('开始执行域名检查...')
+        // 从请求体中获取域名列表
+        const { domains: requestedDomains } = await context.request.json() as { domains: string[] };
+
+        if (!Array.isArray(requestedDomains) || requestedDomains.length === 0) {
+            return Response.json({
+                status: 400,
+                message: '请求参数错误, 需要提供一个包含域名的数组',
+                data: null
+            }, { status: 400 });
+        }
+
         const { results: configResults } = await context.env.DB.prepare(
             'SELECT * FROM alertcfg LIMIT 1'
         ).all<AlertConfig>()
@@ -55,86 +65,97 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
             has_userid: !!config.tg_userid
         })
 
-        // 获取所有域名
-        const { results: domains } = await context.env.DB.prepare(
-            'SELECT domain, expiry_date, tgsend, st_tgsend FROM domains WHERE tgsend = 1 or st_tgsend = 1'
-        ).all<Domain>()
+        const placeholders = requestedDomains.map(() => '?').join(',');
+        const query = `
+            SELECT domain, expiry_date, tgsend, st_tgsend
+            FROM domains
+            WHERE (tgsend = 1 OR st_tgsend = 1) AND domain IN (${placeholders})
+        `;
+        const { results: domains } = await context.env.DB.prepare(query)
+            .bind(...requestedDomains)
+            .all<Domain>();
 
         console.log(`找到 ${domains.length} 个启用通知的域名`)
         const notifiedDomains: any[] = []
+        const offlineDomains: Domain[] = []
+        const expiringDomains: (Domain & { remainingDays: number })[] = []
 
-        // 批量检查域名状态
-        const BATCH_SIZE = 10
-        for (let i = 0; i < domains.length; i += BATCH_SIZE) {
-            const batch = domains.slice(i, i + BATCH_SIZE)
-            console.log(`正在处理第 ${i + 1} 到 ${Math.min(i + BATCH_SIZE, domains.length)} 个域名`)
+        for (const domain of domains) {
+            const remainingDays = calculateRemainingDays(domain.expiry_date)
+            console.log(`检查域名 ${domain.domain}: 过期时间 ${domain.expiry_date}, 剩余天数 ${remainingDays}`)
 
-            await Promise.all(batch.map(async (domain) => {
-                const remainingDays = calculateRemainingDays(domain.expiry_date)
-                console.log(`检查域名 ${domain.domain}: 过期时间 ${domain.expiry_date}, 剩余天数 ${remainingDays}`)
+            // 检查网站连通性
+            const isOnline = await checkDomainStatus(domain.domain)
 
-                // 检查网站连通性
-                const isOnline = await checkDomainStatus(domain.domain)
+            // 更新域名状态
+            const newStatus = isOnline ? '在线' : '离线'
+            await context.env.DB.prepare(
+                'UPDATE domains SET status = ? WHERE domain = ?'
+            ).bind(newStatus, domain.domain).run()
 
-                // 更新域名状态
-                const newStatus = isOnline ? '在线' : '离线'
-                await context.env.DB.prepare(
-                    'UPDATE domains SET status = ? WHERE domain = ?'
-                ).bind(newStatus, domain.domain).run()
+            if (newStatus === '离线' && domain.st_tgsend === 1) {
+                offlineDomains.push(domain)
+            }
 
-                // 如果状态变为离线且启用了通知，发送通知
-                if (newStatus === '离线' && domain.st_tgsend === 1) {
-                    const message = `*🔔 Domains-Support 通知*\n\n` +
-                        `⚠️ *域名服务离线告警*\n\n` +
-                        `🌐 域名：\`${domain.domain}\`\n` +
-                        `📊 状态：离线\n` +
-                        `⏰ 时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n\n` +
-                        `🔍 请检查网站服务状态！`
-
-                    try {
-                        if (config.tg_token && config.tg_userid) {
-                            await sendTelegramMessage(config.tg_token, config.tg_userid, message)
-                            console.log(`成功发送离线通知 (Telegram)：${domain.domain}`)
-                        }
-                        if (config.wx_api && config.wx_token) {
-                            await sendWeChatMessage(config.wx_api, config.wx_token, '来自Domain-Support通知', message)
-                            console.log(`成功发送离线通知 (WeChat)：${domain.domain}`)
-                        }
-                    } catch (error) {
-                        console.error(`发送离线通知失败:`, error)
-                    }
-                }
-
-                // 检查域名是否即将过期
-                if (remainingDays <= config.days && domain.tgsend === 1) {
-                    console.log(`域名 ${domain.domain} 需要发送过期通知：剩余天数(${remainingDays}) <= 阈值(${config.days})`)
-                    const message = `*🔔 Domains-Support通知*\n\n` +
-                        `🌐 域名：\`${domain.domain}\`\n` +
-                        `📅 过期时间：\`${domain.expiry_date}\`\n` +
-                        `⏳ 剩余天数：\`${remainingDays}天\`\n\n` +
-                        `⚠️ 剩余天数告警，请尽快进行续约！`
-
-                    try {
-                        console.log('准备发送过期通知...')
-                        if (config.tg_token && config.tg_userid) {
-                            await sendTelegramMessage(config.tg_token, config.tg_userid, message)
-                            console.log(`成功发送过期通知 (Telegram)：${domain.domain}`)
-                        }
-                        if (config.wx_api && config.wx_token) {
-                            await sendWeChatMessage(config.wx_api, config.wx_token, '来自Domain-Support通知', message)
-                            console.log(`成功发送过期通知 (WeChat)：${domain.domain}`)
-                        }
-                        notifiedDomains.push({
-                            domain: domain.domain,
-                            remainingDays,
-                            expiry_date: domain.expiry_date
-                        })
-                    } catch (error) {
-                        console.error(`发送过期通知失败:`, error)
-                    }
-                }
-            }))
+            // 检查域名是否即将过期
+            if (remainingDays <= config.days && domain.tgsend === 1) {
+                expiringDomains.push({ ...domain, remainingDays })
+            }
         }
+
+        // 统一发送离线通知
+        if (offlineDomains.length > 0) {
+            const offlineDetails = offlineDomains.map(d => `\`${d.domain}\``).join('\n')
+            const message = `*🔔 Domains-Support 通知*\n\n` +
+                `⚠️ *域名服务离线告警*\n\n` +
+                `以下域名无法访问，请立即检查：\n` +
+                `${offlineDetails}\n\n` +
+                `⏰ 时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`
+
+            try {
+                if (config.tg_token && config.tg_userid) {
+                    await sendTelegramMessage(config.tg_token, config.tg_userid, message)
+                    console.log(`成功发送 ${offlineDomains.length} 个域名的离线通知 (Telegram)`)
+                }
+                if (config.wx_api && config.wx_token) {
+                    await sendWeChatMessage(config.wx_api, config.wx_token, '域名服务离线告警', message)
+                    console.log(`成功发送 ${offlineDomains.length} 个域名的离线通知 (WeChat)`)
+                }
+            } catch (error: any) {
+                console.error(`发送离线通知失败:`, error)
+            }
+        }
+
+        // 统一发送过期通知
+        if (expiringDomains.length > 0) {
+            const expiringDetails = expiringDomains
+                .map(d => `\`${d.domain}\` (还剩 ${d.remainingDays} 天, ${d.expiry_date})`)
+                .join('\n')
+            const message = `*🔔 Domains-Support 通知*\n\n` +
+                `⚠️ *域名即将过期提醒*\n\n` +
+                `以下域名即将在 ${config.days} 天内过期，请及时续费：\n` +
+                `${expiringDetails}\n\n` +
+                `⏰ 时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`
+
+            try {
+                if (config.tg_token && config.tg_userid) {
+                    await sendTelegramMessage(config.tg_token, config.tg_userid, message)
+                    console.log(`成功发送 ${expiringDomains.length} 个域名的过期通知 (Telegram)`)
+                }
+                if (config.wx_api && config.wx_token) {
+                    await sendWeChatMessage(config.wx_api, config.wx_token, '域名即将过期提醒', message)
+                    console.log(`成功发送 ${expiringDomains.length} 个域名的过期通知 (WeChat)`)
+                }
+                notifiedDomains.push(...expiringDomains.map(d => ({
+                    domain: d.domain,
+                    remainingDays: d.remainingDays,
+                    expiry_date: d.expiry_date
+                })))
+            } catch (error: any) {
+                console.error(`发送过期通知失败:`, error)
+            }
+        }
+
 
         return Response.json({
             status: 200,
@@ -144,7 +165,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
                 notified_domains: notifiedDomains
             }
         })
-    } catch (error) {
+    } catch (error: any) {
         console.error('检查执行失败:', error)
         return Response.json({
             status: 500,
@@ -168,91 +189,47 @@ function calculateRemainingDays(expiryDate: string): number {
 }
 
 async function checkDomainStatus(domain: string): Promise<boolean> {
-    // 检查网站连通性，最多重试3次
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-            const controller = new AbortController()
-            const timeoutPromise = new Promise<Response>((_, reject) => {
-                setTimeout(() => {
-                    controller.abort()
-                    reject(new Error('Timeout'))
-                }, 10000) // 增加超时时间到 10 秒
-            })
-
-            // 优先尝试 HTTPS
-            const httpsFetchPromise = fetch(`https://${domain}`, {
-                method: 'GET',
-                redirect: 'follow',
-                signal: controller.signal,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Connection': 'close',
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache',
-                    'Sec-Fetch-Dest': 'document',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Site': 'none',
-                    'Sec-Fetch-User': '?1',
-                    'Upgrade-Insecure-Requests': '1'
-                }
-            })
-
+    const tryFetch = async (protocol: 'https' | 'http') => {
+        for (let attempt = 1; attempt <= 2; attempt++) {
             try {
-                const response = await Promise.race([httpsFetchPromise, timeoutPromise])
-                if (response instanceof Response) {
-                    // 放宽判定标准：只要状态码小于 520 (Cloudflare Origin Error) 或等于 530 (DNS Error) 都算在线
-                    // 530 通常是 Cloudflare 1xxx 错误，可能是 Worker 访问受限，但说明域名解析正常
-                    if (response.status < 520 || response.status === 530) {
-                        return true
-                    }
-                    console.log(`域名 ${domain} HTTPS 返回状态码: ${response.status}`)
-                }
-            } catch (httpsError) {
-                console.error(`HTTPS 检查域名 ${domain} 失败（第${attempt}次）:`, httpsError)
-                
-                // 如果 HTTPS 失败，尝试 HTTP
-                const httpFetchPromise = fetch(`http://${domain}`, {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+                const targetUrl = `${protocol}://${domain}`;
+                console.log(`正在尝试通过 ${protocol.toUpperCase()} 协议检查域名: ${targetUrl} (第${attempt}次)`);
+                const response = await fetch(targetUrl, {
                     method: 'GET',
                     redirect: 'follow',
                     signal: controller.signal,
                     headers: {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                        'Accept-Encoding': 'gzip, deflate, br',
-                        'Connection': 'close',
-                        'Cache-Control': 'no-cache',
-                        'Pragma': 'no-cache',
-                        'Sec-Fetch-Dest': 'document',
-                        'Sec-Fetch-Mode': 'navigate',
-                        'Sec-Fetch-Site': 'none',
-                        'Sec-Fetch-User': '?1',
-                        'Upgrade-Insecure-Requests': '1'
                     }
-                })
+                });
 
-                try {
-                    const response = await Promise.race([httpFetchPromise, timeoutPromise])
-                    if (response instanceof Response) {
-                        if (response.status < 520 || response.status === 530) {
-                            return true
-                        }
-                        console.log(`域名 ${domain} HTTP 返回状态码: ${response.status}`)
-                    }
-                } catch (httpError) {
-                    console.error(`HTTP 检查域名 ${domain} 失败（第${attempt}次）:`, httpError)
+                clearTimeout(timeoutId);
+
+                if (response.ok) {
+                    console.log(`域名 ${domain} 通过 ${protocol.toUpperCase()} 检查在线`);
+                    return true;
                 }
+                console.log(`域名 ${domain} ${protocol.toUpperCase()} 返回状态码: ${response.status} (第${attempt}次)`);
+            } catch (error: any) {
+                console.error(`${protocol.toUpperCase()} 检查域名 ${domain} 失败 (第${attempt}次):`, error.name === 'AbortError' ? 'Timeout' : error, '完整错误对象:', error);
             }
-        } catch (error) {
-            console.error(`检查域名 ${domain} 失败（第${attempt}次）:`, error)
         }
-        // 如果本次未成功，自动进入下一次重试
+        console.log(`域名 ${domain} 通过 ${protocol.toUpperCase()} 的所有检查均失败`);
+        return false;
+    };
+
+    // 优先尝试 HTTPS
+    if (await tryFetch('https')) {
+        return true;
     }
-    console.log(`域名 ${domain} 最终检查结果: 离线`)
-    return false
+
+    // 如果 HTTPS 失败，则尝试 HTTP
+    console.log(`域名 ${domain} 的 HTTPS 检查失败，正在尝试 HTTP...`);
+    return await tryFetch('http');
 }
 
 async function sendTelegramMessage(token: string, chatId: string, message: string): Promise<void> {
@@ -303,14 +280,14 @@ async function sendWeChatMessage(apiUrl: string, token: string, title: string, t
             body: body,
         });
 
-        const responseData = await response.json();
+        const responseData = await response.text();
 
         if (!response.ok) {
             console.error('WeChat API 响应错误:', responseData);
         } else {
             console.log('WeChat API 响应:', responseData);
         }
-    } catch (error) {
+    } catch (error: any) {
         console.error('发送 WeChat 消息失败:', error);
     }
 }
